@@ -1,5 +1,6 @@
 dist/
 Tools/Sysinternals/
+Cases/
 *.zip
 *.sha256.txt
-Cases/
+
