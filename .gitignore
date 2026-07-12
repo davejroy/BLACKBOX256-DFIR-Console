@@ -1,3 +1,13 @@
+# Sysinternals auto-download
 Tools/Sysinternals/
 *.zip
 *.exe
+
+# Build artifacts
+dist/
+*.iso
+*.zip
+
+# PowerShell
+*.ps1~
+*.psm1~
