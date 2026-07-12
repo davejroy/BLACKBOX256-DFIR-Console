@@ -1,0 +1,17 @@
+hindsight.log
+hindsight_config.json
+.idea/
+build/
+dist/
+node_modules/
+pyhindsight/static/web_modules/
+**/__pycache__/
+*.pyc
+*.egg-info/
+/.local/bin/buf
+.venv*/
+*.xlsx
+.claude/
+hindsight-temp/
+data-sets/
+/temp_outputs/
