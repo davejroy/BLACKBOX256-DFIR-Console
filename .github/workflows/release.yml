@@ -18,6 +18,41 @@ jobs:
         run: |
           ./Build-Release.ps1 -Tag "${{ github.ref_name }}"
 
+      - name: Smoke Test, Profile Selection, Integrity Export, Manifest, Report
+        shell: pwsh
+        run: |
+          $root = "$(Get-Location)"
+          $tag  = "${{ github.ref_name }}"
+
+          # Load DFIR Console Loader
+          . "$root/DFIR-Console.ps1"
+
+          # Auto-select DFIR profile based on tag
+          Select-DfirProfileFromTag -TagName $tag
+
+          # Run smoke test (profile-aware)
+          Invoke-PostReleaseSmokeTest -ReleaseRoot $root
+
+          # Export integrity dashboards
+          Export-ToolIntegrityJson -OutputPath "$root/dist/tool-integrity.json"
+          Export-ToolIntegrityHtml -OutputPath "$root/dist/tool-integrity.html"
+
+          # Export DFIR Release Manifest
+          Export-ReleaseManifestJson -OutputPath "$root/dist/release-manifest.json" -TagName $tag
+
+          # Generate forensic report template
+          New-ForensicReportTemplate -OutputPath "$root/dist/forensic-report-template.md" -TagName $tag
+
+      - name: Upload Integrity and Manifest Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfir-integrity-and-manifest
+          path: |
+            dist/tool-integrity.json
+            dist/tool-integrity.html
+            dist/release-manifest.json
+            dist/forensic-report-template.md
+
       - name: Create GitHub Release
         id: create_release
         uses: actions/create-release@v1
@@ -28,6 +63,18 @@ jobs:
           release_name: "BLACKBOX256 ${{ github.ref_name }}"
           draft: false
           prerelease: false
+          body: |
+            BLACKBOX256 DFIR Release
+
+            DFIR Profile: (auto-selected from tag)
+            Tag: ${{ github.ref_name }}
+
+            See attached assets:
+            - BLACKBOX256_USB-${{ github.ref_name }}.zip
+            - BLACKBOX256_USB-${{ github.ref_name }}.sha256.txt
+            - tool-integrity.html (Tool Integrity Dashboard)
+            - release-manifest.json (DFIR Release Manifest)
+            - forensic-report-template.md (Report Template)
 
       - name: Upload ZIP asset
         uses: actions/upload-release-asset@v1
@@ -49,3 +96,32 @@ jobs:
           asset_name: BLACKBOX256_USB-${{ github.ref_name }}.sha256.txt
           asset_content_type: text/plain
 
+      - name: Upload HTML Integrity Dashboard asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/tool-integrity.html
+          asset_name: tool-integrity.html
+          asset_content_type: text/html
+
+      - name: Upload Release Manifest asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/release-manifest.json
+          asset_name: release-manifest.json
+          asset_content_type: application/json
+
+      - name: Upload Forensic Report Template asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/forensic-report-template.md
+          asset_name: forensic-report-template.md
+          asset_content_type: text/markdown

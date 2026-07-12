@@ -1,37 +1,76 @@
 <#
-Build-Release.ps1
-Packages BLACKBOX256_USB into a versioned ZIP + SHA256 hash.
-Used by GitHub Actions and can be run locally.
+.SYNOPSIS
+    Builds a release package for BLACKBOX256‑DFIR‑Console.
+
+.DESCRIPTION
+    This script:
+      • Ensures Sysinternals Suite is downloaded dynamically
+      • Builds a clean release ZIP and SHA256 checksum
+      • Tags the release version automatically
+      • Prepares artifacts for GitHub Actions or manual upload
+
+.NOTES
+    Author: David Roy
+    Version: 1.0.2
+    Date: July 2026
 #>
 
-param(
-    [Parameter(Mandatory)][string]$Tag
+Write-Host "=== Building BLACKBOX256‑DFIR‑Console Release ==="
+
+# --- Environment setup ---
+$RootPath   = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$DistPath   = Join-Path $RootPath "dist"
+$VersionFile = Join-Path $RootPath "VERSION"
+$Version     = Get-Content $VersionFile -ErrorAction Stop
+$Tag         = "v$Version"
+
+# --- Ensure output directory exists ---
+if (-not (Test-Path $DistPath)) {
+    New-Item -ItemType Directory -Path $DistPath | Out-Null
+}
+
+# --- Load Sysinternals auto‑download module ---
+Import-Module "$RootPath\Modules\Sysinternals\Get-Sysinternals.ps1" -Force
+$SysinternalsPath = Get-SysinternalsSuite
+Write-Host "[+] Sysinternals Suite ready at: $SysinternalsPath"
+
+# --- Define release contents ---
+$ReleaseName = "BLACKBOX256_USB-$Tag"
+$ZipPath     = Join-Path $DistPath "$ReleaseName.zip"
+$ShaPath     = Join-Path $DistPath "$ReleaseName.sha256.txt"
+
+# --- Clean previous artifacts ---
+if (Test-Path $ZipPath) { Remove-Item $ZipPath -Force }
+if (Test-Path $ShaPath) { Remove-Item $ShaPath -Force }
+
+# --- Build ZIP ---
+Write-Host "[+] Creating release ZIP..."
+$ItemsToInclude = @(
+    "$RootPath\DFIR-Console.ps1",
+    "$RootPath\Modules",
+    "$RootPath\Tools",
+    "$RootPath\VERSION"
 )
 
-$projectRoot = "C:\Users\davej\OneDrive\Documents\Dev\BLACKBOX256_USB"
-$distRoot    = Join-Path $projectRoot "dist"
+Compress-Archive -Path $ItemsToInclude -DestinationPath $ZipPath -Force
+Write-Host "[+] ZIP created: $ZipPath"
 
-Write-Host "Building release for tag: $Tag"
+# --- Generate SHA256 checksum ---
+Write-Host "[+] Generating SHA256 checksum..."
+$Hash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
+$Hash | Out-File $ShaPath -Encoding ASCII
+Write-Host "[+] SHA256 checksum written to: $ShaPath"
 
-if (-not (Test-Path $distRoot)) {
-    New-Item -ItemType Directory -Path $distRoot | Out-Null
-}
+# --- Tag and commit (optional for CI/CD) ---
+Write-Host "[+] Tagging release version..."
+git tag -a $Tag -m "Release $Tag"
+git push origin $Tag
 
-$zipName  = "BLACKBOX256_USB-$Tag.zip"
-$zipPath  = Join-Path $distRoot $zipName
-$hashPath = Join-Path $distRoot ("BLACKBOX256_USB-$Tag.sha256.txt")
-
-if (Test-Path $zipPath) {
-    Remove-Item $zipPath -Force
-}
-
-Write-Host "Creating ZIP: $zipPath"
-Compress-Archive -Path "$projectRoot\*" -DestinationPath $zipPath -Force
-
-Write-Host "Computing SHA256..."
-$hash = Get-FileHash -Path $zipPath -Algorithm SHA256
-"$($hash.Hash)  $zipName" | Set-Content $hashPath
-
-Write-Host "Release build complete:"
-Write-Host "  ZIP:   $zipPath"
-Write-Host "  SHA256: $hashPath"
+# --- Summary ---
+Write-Host ""
+Write-Host "=== Release Build Complete ==="
+Write-Host "Version:  $Version"
+Write-Host "Tag:      $Tag"
+Write-Host "ZIP:      $ZipPath"
+Write-Host "SHA256:   $ShaPath"
+Write-Host "================================"

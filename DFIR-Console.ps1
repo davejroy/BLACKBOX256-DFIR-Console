@@ -1,275 +1,1536 @@
 <#
-DFIR-Console.ps1
-BLACKBOX256 DFIR Console (Modular, Version-Aware, PowerShell 5.1–7.6.3 Compatible)
-Author: David (Vardryn/Tyvant DFIR Labs)
+.SYNOPSIS
+    BLACKBOX256 DFIR Console Loader
+
+.DESCRIPTION
+    Entry point for BLACKBOX256-DFIR-Console:
+      - First-run environment validation
+      - Sysinternals auto-download
+      - Tool integrity dashboard (CLI + GUI)
+      - DFIR profile selector (manual + tag-based)
+      - Profile-aware post-release smoke test
+      - JSON/HTML integrity export
+      - DFIR Release Manifest JSON
+      - Forensic report template
 #>
 
-# ============================================================
-# PowerShell Version Detection + Compatibility Mode
-# ============================================================
+# --- Global paths ---
+$ScriptRoot      = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$ModulesRoot     = Join-Path $ScriptRoot "Modules"
+$ToolsRoot       = Join-Path $ScriptRoot "Tools"
+$SysinternalsMod = Join-Path $ModulesRoot "Sysinternals\Get-Sysinternals.ps1"
 
-$major = $PSVersionTable.PSVersion.Major
-$minor = $PSVersionTable.PSVersion.Minor
-
-Write-Host ""
-Write-Host "Detected PowerShell version: $major.$minor"
-Write-Host ""
-
-# -------------------------------------------
-# Reject anything older than 5.1
-# -------------------------------------------
-if ($major -lt 5 -or ($major -eq 5 -and $minor -lt 1)) {
-    Write-Host "ERROR: BLACKBOX256 requires at least PowerShell 5.1."
-    Write-Host "Your version is deprecated and cannot run this DFIR console."
-    exit
+#--- Load Case engine ----
+$CaseEngineMod = Join-Path $ModulesRoot "CaseEngine\CaseEngine.ps1"
+if (Test-Path $CaseEngineMod) {
+    . $CaseEngineMod
+} else {
+    Write-Warning "CaseEngine module not found: $CaseEngineMod"
 }
 
-# -------------------------------------------
-# PowerShell 5.1 → Limited Mode
-# -------------------------------------------
-if ($major -eq 5) {
+# --- Load Sysinternals auto-download ---
+if (Test-Path $SysinternalsMod) {
+    Import-Module $SysinternalsMod -Force
+    $Global:SysinternalsPath = Get-SysinternalsSuite
+} else {
+    Write-Warning "Sysinternals module not found: $SysinternalsMod"
+}
 
-    Write-Host "==============================================================="
-    Write-Host "  LIMITED MODE: Running BLACKBOX256 under PowerShell 5.1"
-    Write-Host "==============================================================="
-    Write-Host ""
-    Write-Host "Your PowerShell version is legacy and missing modern features."
-    Write-Host ""
-    Write-Host "Available modules:"
-    Write-Host "  ✔ System Info"
-    Write-Host "  ✔ Event Logs"
-    Write-Host "  ✔ Registry Persistence"
-    Write-Host "  ✔ Remote Access"
-    Write-Host "  ✔ Licensing"
-    Write-Host ""
-    Write-Host "Unavailable modules:"
-    Write-Host "  ✖ Memory Capture (requires PS7)"
-    Write-Host "  ✖ Forensic Imaging (requires PS7)"
-    Write-Host "  ✖ Advanced triage features"
-    Write-Host ""
-    Write-Host "PowerShell 7 is strongly recommended for:"
-    Write-Host "  - Full DFIR capability"
-    Write-Host "  - Better stability"
-    Write-Host "  - Modern module support"
-    Write-Host "  - Improved performance"
-    Write-Host ""
+# Default DFIR profile
+if (-not $Global:DfirProfile) { $Global:DfirProfile = "Generic Triage" }
+if (-not $Global:DfirTools)   { $Global:DfirTools   = @("Plaso","Chainsaw","Sysinternals Suite") }
 
-    $upgrade = Read-Host "Upgrade to PowerShell 7 now? (Y/N)"
+# ==========================
+#  First-Run Environment Validator
+# ==========================
+function Invoke-EnvironmentValidator {
+    Write-Host "=== Environment Validator ==="
 
-    if ($upgrade -eq "Y") {
-        Write-Host "Installing PowerShell 7 via Winget..."
-        try {
-            winget install Microsoft.PowerShell --silent --accept-package-agreements --accept-source-agreements
-            Write-Host "PowerShell 7 installed. Relaunching..."
-            & "C:\Program Files\PowerShell\7\pwsh.exe" -File $PSCommandPath
-            exit
-        } catch {
-            Write-Host "Automatic installation failed. Continuing in limited mode."
+    $issues = @()
+
+    # PowerShell version
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $issues += "PowerShell 7+ is recommended. Current: $($PSVersionTable.PSVersion)"
+    }
+
+    # Required folders
+    foreach ($path in @($ModulesRoot, $ToolsRoot)) {
+        if (-not (Test-Path $path)) {
+            $issues += "Missing required directory: $path"
         }
     }
 
-    # Enable compatibility mode
-    $Global:CompatibilityMode = $true
+    # Sysinternals presence
+    if (-not (Test-Path $Global:SysinternalsPath)) {
+        $issues += "Sysinternals Suite not present at: $Global:SysinternalsPath"
+    }
+
+    if ($issues.Count -eq 0) {
+        Write-Host "[+] Environment OK" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "[!] Environment issues detected:" -ForegroundColor Yellow
+        $issues | ForEach-Object { Write-Host " - $_" }
+        return $false
+    }
 }
 
-# -------------------------------------------
-# PowerShell 7+ → Full Mode
-# -------------------------------------------
-if ($major -ge 7) {
-    Write-Host "==============================================================="
-    Write-Host "  FULL MODE: Running BLACKBOX256 under PowerShell 7.x"
-    Write-Host "==============================================================="
-    Write-Host ""
-    $Global:CompatibilityMode = $false
+# ==========================
+#  Tool Integrity Dashboard (CLI)
+# ==========================
+function Show-ToolIntegrityDashboard {
+    Write-Host "=== Tool Integrity Dashboard (CLI) ==="
+
+    $tools = Get-ToolIntegrityData
+
+    foreach ($tool in $tools) {
+        $color = if ($tool.Status -eq "OK") { "Green" } else { "Red" }
+        Write-Host ("{0,-20} {1,-8} {2}" -f $tool.Name, $tool.Status, $tool.Path) -ForegroundColor $color
+    }
 }
 
-# ============================================================
-# Global Configuration
-# ============================================================
+# ==========================
+#  Tool Integrity Data (shared)
+# ==========================
+function Get-ToolIntegrityData {
+    $tools = @(
+        @{ Name = "Sysinternals Suite"; Path = $Global:SysinternalsPath },
+        @{ Name = "Plaso";              Path = Join-Path $ToolsRoot "Plaso" },
+        @{ Name = "Chainsaw";           Path = Join-Path $ToolsRoot "Chainsaw" },
+        @{ Name = "EZTools";            Path = Join-Path $ToolsRoot "EZTools" },
+        @{ Name = "Volatility";         Path = Join-Path $ToolsRoot "Volatility" },
+        @{ Name = "YARA";               Path = Join-Path $ToolsRoot "YARA" }
+    )
 
-$Global:ToolRoot      = "C:\Users\davej\OneDrive\Documents\Dev\BLACKBOX256_USB"
-$Global:EvidenceRoot  = "F:\BLACKBOX-EVIDENCE"
-$Global:ImageRoot     = "G:\FORENSIC-IMAGES"
+    $data = @()
 
-$Global:DriveStatus = @{
-    "E" = $false
-    "F" = $false
-    "G" = $false
+    foreach ($tool in $tools) {
+        $exists = Test-Path $tool.Path
+        $data += [PSCustomObject]@{
+            Name   = $tool.Name
+            Path   = $tool.Path
+            Status = if ($exists) { "OK" } else { "MISSING" }
+        }
+    }
+
+    return $data
 }
 
-$Global:LogFile = Join-Path $Global:EvidenceRoot "BLACKBOX256_DFIR_Console.log"
+# ==========================
+#  Tool Integrity Export (JSON/HTML)
+# ==========================
+function Export-ToolIntegrityJson {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\tool-integrity.json"
+    )
 
-# ============================================================
-# Module Imports
-# ============================================================
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
 
-# Core utilities (must be first)
-Import-Module (Join-Path $Global:ToolRoot "Modules\Utils.psm1") -Force
-
-# Primary modules
-Import-Module (Join-Path $Global:ToolRoot "Modules\SystemInfo.psm1")     -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\EventLogs.psm1")      -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\Registry.psm1")       -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\RemoteAccess.psm1")   -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\Licensing.psm1")      -Force
-
-# Advanced modules (PS7 only)
-Import-Module (Join-Path $Global:ToolRoot "Modules\MemoryCapture.psm1")  -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\Imaging.psm1")        -Force
-
-# NEW modules you requested
-Import-Module (Join-Path $Global:ToolRoot "Modules\Timeline.psm1")          -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\BrowserArtifacts.psm1")  -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\YaraScan.psm1")          -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\EZTools.psm1")           -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\Chainsaw.psm1")          -Force
-Import-Module (Join-Path $Global:ToolRoot "Modules\Volatility.psm1")        -Force
-
-
-# ============================================================
-# Startup: Drive Checks, Experience Level, Incident Context
-# ============================================================
-
-Ensure-Directory (Split-Path $Global:LogFile -Parent)
-Write-Log "BLACKBOX256 DFIR Console started."
-
-Check-DriveAvailability -DriveStatus $Global:DriveStatus
-
-$experience = Select-ExperienceLevel
-$context    = Collect-IncidentContext
-
-# ============================================================
-# Menus
-# ============================================================
-
-function Show-MainMenu {
-    Write-Host ""
-    Write-Host "=== BLACKBOX256 DFIR Main Menu ==="
-    Write-Host "  1. Primary Modules"
-    Write-Host "  2. Secondary Modules"
-    Write-Host "  3. Advanced Modules (PS7 only)"
-    Write-Host "  4. Run ALL Modules"
-    Write-Host "  5. Exit"
-    Read-Host "Select option (1-5)"
+    $data = Get-ToolIntegrityData
+    $data | ConvertTo-Json -Depth 3 | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Tool integrity JSON exported to: $OutputPath"
 }
 
-function Show-PrimaryMenu {
-    Write-Host ""
-    Write-Host "Primary Modules:"
-    Write-Host "  1. System & OS Info (preferred F: ≥ 1 GB)"
-    Write-Host "  2. Event Logs (preferred F: ≥ 5 GB)"
-    Write-Host "  3. Registry Persistence (preferred F: ≥ 1 GB)"
-    Write-Host "  4. Run ALL"
-    Read-Host "Select option (1-4)"
+function Export-ToolIntegrityHtml {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\tool-integrity.html"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $data = Get-ToolIntegrityData
+
+    $html = @"
+<html>
+<head>
+    <title>BLACKBOX256 Tool Integrity Dashboard</title>
+    <style>
+        body { font-family: Segoe UI, sans-serif; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ccc; padding: 8px; }
+        th { background-color: #f0f0f0; }
+        .ok { color: green; }
+        .missing { color: red; }
+    </style>
+</head>
+<body>
+<h1>BLACKBOX256 Tool Integrity Dashboard</h1>
+<p>DFIR Profile: $Global:DfirProfile</p>
+<table>
+<tr><th>Name</th><th>Status</th><th>Path</th></tr>
+"@
+
+    foreach ($item in $data) {
+        $cls = if ($item.Status -eq "OK") { "ok" } else { "missing" }
+        $html += "<tr><td>$($item.Name)</td><td class='$cls'>$($item.Status)</td><td>$($item.Path)</td></tr>`n"
+    }
+
+    $html += @"
+</table>
+</body>
+</html>
+"@
+
+    $html | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Tool integrity HTML exported to: $OutputPath"
 }
 
-function Show-SecondaryMenu {
-    Write-Host ""
-    Write-Host "Secondary Modules:"
-    Write-Host "  1. Remote Access Suite (preferred F: ≥ 1 GB)"
-    Write-Host "  2. Licensing Suite (preferred F: ≥ 1 GB)"
-    Write-Host "  3. Run ALL"
-    Read-Host "Select option (1-3)"
-}
+# ==========================
+#  DFIR Profile Selector (manual)
+# ==========================
+function Select-DfirProfile {
+    Write-Host "=== DFIR Profile Selector ==="
+    Write-Host "1) Ransomware Incident"
+    Write-Host "2) Insider Data Theft"
+    Write-Host "3) Web Server Compromise"
+    Write-Host "4) Generic Triage"
 
-function Show-AdvancedMenu {
-    Write-Host ""
-    Write-Host "Advanced DFIR Modules (PowerShell 7 required):"
-    Write-Host "  1. Memory Capture (preferred F: ≥ 128 GB)"
-    Write-Host "  2. Forensic Imaging (preferred F: ≥ 10 GB, G: ≥ target disk size)"
-    Write-Host "  3. Run ALL"
-    Read-Host "Select option (1-3)"
-}
-
-# ============================================================
-# Orchestration
-# ============================================================
-
-function Run-PrimaryModules {
-    param([string]$choice)
+    $choice = Read-Host "Select profile"
 
     switch ($choice) {
-        "1" { Invoke-SystemInfo          -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot }
-        "2" { Invoke-EventLogs           -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot }
-        "3" { Invoke-RegistryPersistence -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot }
+        "1" {
+            $Global:DfirProfile = "Ransomware"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Volatility", "YARA", "Sysinternals Suite")
+        }
+        "2" {
+            $Global:DfirProfile = "Insider Theft"
+            $Global:DfirTools = @("Plaso", "Browser Forensics", "EZTools", "YARA")
+        }
+        "3" {
+            $Global:DfirProfile = "Web Compromise"
+            $Global:DfirTools = @("Plaso", "Log Parsers", "YARA", "Sysinternals Suite")
+        }
         "4" {
-            Invoke-SystemInfo          -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot
-            Invoke-EventLogs           -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot
-            Invoke-RegistryPersistence -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot
+            $Global:DfirProfile = "Generic Triage"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Sysinternals Suite")
         }
+        default {
+            Write-Host "Invalid selection, defaulting to Generic Triage."
+            $Global:DfirProfile = "Generic Triage"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Sysinternals Suite")
+        }
+    }
+
+    Write-Host "[+] Active DFIR profile: $Global:DfirProfile"
+    Write-Host "[+] Tools in profile: $($Global:DfirTools -join ', ')"
+}
+
+# ==========================
+#  DFIR Profile Selector (from tag)
+# ==========================
+function Select-DfirProfileFromTag {
+    param([string]$TagName)
+
+    if ($TagName -match "ransomware") {
+        $Global:DfirProfile = "Ransomware"
+        $Global:DfirTools = @("Plaso","Chainsaw","Volatility","YARA","Sysinternals Suite")
+    }
+    elseif ($TagName -match "insider") {
+        $Global:DfirProfile = "Insider Theft"
+        $Global:DfirTools = @("Plaso","Browser Forensics","EZTools","YARA")
+    }
+    elseif ($TagName -match "web") {
+        $Global:DfirProfile = "Web Compromise"
+        $Global:DfirTools = @("Plaso","Log Parsers","YARA","Sysinternals Suite")
+    }
+    else {
+        $Global:DfirProfile = "Generic Triage"
+        $Global:DfirTools = @("Plaso","Chainsaw","Sysinternals Suite")
+    }
+
+    Write-Host "[+] Auto-selected DFIR profile from tag '$TagName': $Global:DfirProfile"
+    Write-Host "[+] Tools: $($Global:DfirTools -join ', ')"
+}
+
+# ==========================
+#  DFIR Release Manifest JSON
+# ==========================
+function Export-ReleaseManifestJson {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\release-manifest.json",
+        [string]$TagName    = "unknown"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $versionFile = Join-Path $ScriptRoot "VERSION"
+    $version     = if (Test-Path $versionFile) { Get-Content $versionFile } else { "unknown" }
+
+    $tools = Get-ToolIntegrityData
+
+    $manifest = [PSCustomObject]@{
+        Project      = "BLACKBOX256-DFIR-Console"
+        Version      = $version
+        Tag          = $TagName
+        DfirProfile  = $Global:DfirProfile
+        Tools        = $tools
+        GeneratedAt  = (Get-Date).ToString("o")
+    }
+
+    $manifest | ConvertTo-Json -Depth 5 | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Release manifest JSON exported to: $OutputPath"
+}
+
+# ==========================
+#  Forensic Report Template
+# ==========================
+function New-ForensicReportTemplate {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\forensic-report-template.md",
+        [string]$TagName    = "unknown"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $versionFile = Join-Path $ScriptRoot "VERSION"
+    $version     = if (Test-Path $versionFile) { Get-Content $versionFile } else { "unknown" }
+
+    $content = @"
+# BLACKBOX256 DFIR Report
+
+- Project: BLACKBOX256-DFIR-Console
+- Version: $version
+- Tag: $TagName
+- DFIR Profile: $Global:DfirProfile
+- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+## 1. Incident Summary
+
+## 2. Scope and Assets
+
+## 3. Tools Used
+
+$(($Global:DfirTools -join ", "))
+
+## 4. Timeline
+
+## 5. Findings
+
+## 6. Recommendations
+
+"@
+
+    $content | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Forensic report template exported to: $OutputPath"
+}
+
+# ==========================
+#  Post-Release Smoke Test (profile-aware)
+# ==========================
+function Invoke-PostReleaseSmokeTest {
+    param([string]$ReleaseRoot = $ScriptRoot)
+
+    Write-Host "=== Post-Release Smoke Test ==="
+
+    $checks = @(
+        @{ Name = "DFIR-Console.ps1"; Path = Join-Path $ReleaseRoot "DFIR-Console.ps1" },
+        @{ Name = "Modules";          Path = Join-Path $ReleaseRoot "Modules" },
+        @{ Name = "Tools";            Path = Join-Path $ReleaseRoot "Tools" },
+        @{ Name = "VERSION";          Path = Join-Path $ReleaseRoot "VERSION" }
+    )
+
+    $failed = @()
+
+    foreach ($check in $checks) {
+        if (Test-Path $check.Path) {
+            Write-Host "[+] $($check.Name) present" -ForegroundColor Green
+        } else {
+            Write-Host "[!] $($check.Name) missing: $($check.Path)" -ForegroundColor Red
+            $failed += $check.Name
+        }
+    }
+
+    Write-Host "[+] Checking DFIR profile tools: $Global:DfirProfile"
+
+    foreach ($tool in $Global:DfirTools) {
+        $path = switch ($tool) {
+            "Sysinternals Suite" { $Global:SysinternalsPath }
+            "Plaso"              { Join-Path $ToolsRoot "Plaso" }
+            "Chainsaw"           { Join-Path $ToolsRoot "Chainsaw" }
+            "EZTools"            { Join-Path $ToolsRoot "EZTools" }
+            "Volatility"         { Join-Path $ToolsRoot "Volatility" }
+            "YARA"               { Join-Path $ToolsRoot "YARA" }
+            "Browser Forensics"  { Join-Path $ToolsRoot "BrowserForensics" }
+            "Log Parsers"        { Join-Path $ToolsRoot "LogParsers" }
+            default              { Join-Path $ToolsRoot $tool }
+        }
+
+        if (Test-Path $path) {
+            Write-Host "[+] $tool present at $path" -ForegroundColor Green
+        } else {
+            Write-Host "[!] $tool missing at $path" -ForegroundColor Red
+            $failed += $tool
+        }
+    }
+
+    if ($failed.Count -eq 0) {
+        Write-Host "[+] Smoke test PASSED" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "[!] Smoke test FAILED. Missing: $($failed -join ', ')" -ForegroundColor Red
+        return $false
     }
 }
 
-function Run-SecondaryModules {
-    param([string]$choice)
+# ==========================
+#  GUI Interface (WPF)
+# ==========================
+function Start-GuiInterface {
+    Add-Type -AssemblyName PresentationFramework
 
-    switch ($choice) {
-        "1" { Invoke-RemoteAccessSuite -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot }
-        "2" { Invoke-LicensingSuite    -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot }
-        "3" {
-            Invoke-RemoteAccessSuite -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot
-            Invoke-LicensingSuite    -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot
+    $window = New-Object Windows.Window
+    $window.Title = "BLACKBOX256 DFIR Console"
+    $window.Width = 800
+    $window.Height = 600
+
+    $grid = New-Object Windows.Controls.Grid
+    $window.Content = $grid
+
+    # Buttons
+    $btnEnv = New-Object Windows.Controls.Button
+    $btnEnv.Content = "Environment Validator"
+    $btnEnv.Margin = "10,10,10,0"
+    $btnEnv.Height = 40
+
+    $btnTools = New-Object Windows.Controls.Button
+    $btnTools.Content = "Tool Integrity Dashboard"
+    $btnTools.Margin = "10,60,10,0"
+    $btnTools.Height = 40
+
+    $btnSmoke = New-Object Windows.Controls.Button
+    $btnSmoke.Content = "Post-Release Smoke Test"
+    $btnSmoke.Margin = "10,110,10,0"
+    $btnSmoke.Height = 40
+
+    $btnProfile = New-Object Windows.Controls.Button
+    $btnProfile.Content = "DFIR Profile Selector"
+    $btnProfile.Margin = "10,160,10,0"
+    $btnProfile.Height = 40
+
+    $output = New-Object Windows.Controls.TextBox
+    $output.Margin = "10,210,10,10"
+    $output.VerticalScrollBarVisibility = "Auto"
+    $output.HorizontalScrollBarVisibility = "Auto"
+    $output.AcceptsReturn = $true
+    $output.IsReadOnly = $true
+
+    $grid.Children.Add($btnEnv)
+    $grid.Children.Add($btnTools)
+    $grid.Children.Add($btnSmoke)
+    $grid.Children.Add($btnProfile)
+    $grid.Children.Add($output)
+
+    # Wire up events
+    $btnEnv.Add_Click({
+        $result = Invoke-EnvironmentValidator
+        $output.AppendText("Environment Validator: $result`r`n")
+    })
+
+    $btnTools.Add_Click({
+        $output.AppendText("Tool Integrity Dashboard:`r`n")
+        $tools = Get-ToolIntegrityData
+        foreach ($tool in $tools) {
+            $output.AppendText((" - {0}: {1}`r`n" -f $tool.Name, $tool.Status))
         }
-    }
+    })
+
+    $btnSmoke.Add_Click({
+        $result = Invoke-PostReleaseSmokeTest -ReleaseRoot $ScriptRoot
+        $output.AppendText("Smoke Test: $result`r`n")
+    })
+
+    $btnProfile.Add_Click({
+        Select-DfirProfile
+        $output.AppendText("DFIR Profile: $Global:DfirProfile`r`n")
+    })
+
+    $window.ShowDialog() | Out-Null
 }
 
-function Run-AdvancedModules {
-    param([string]$choice)
-
-    if ($Global:CompatibilityMode) {
-        Write-Host ""
-        Write-Host "Advanced modules require PowerShell 7."
-        Write-Host "Please upgrade to unlock Memory Capture and Forensic Imaging."
-        Write-Host ""
-        return
-    }
-
-    switch ($choice) {
-        "1" { Invoke-MemoryCapture   -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot -Context $context }
-        "2" { Invoke-ForensicImaging -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot -ImageRoot $Global:ImageRoot }
-        "3" {
-            Invoke-MemoryCapture   -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot -Context $context
-            Invoke-ForensicImaging -DriveStatus $Global:DriveStatus -EvidenceRoot $Global:EvidenceRoot -ImageRoot $Global:ImageRoot
-        }
-    }
-}
-
-function Start-DFIRConsole {
+# ==========================
+#  CLI Interface
+# ==========================
+function Start-CliInterface {
+    Write-Host "=== BLACKBOX256 DFIR Console (CLI) ==="
+    Write-Host "1) Environment Validator"
+    Write-Host "2) Tool Integrity Dashboard"
+    Write-Host "3) Post-Release Smoke Test"
+    Write-Host "4) DFIR Profile Selector"
+    Write-Host "5) Export Integrity (JSON/HTML)"
+    Write-Host "6) Export Release Manifest"
+    Write-Host "7) Generate Forensic Report Template"
+    Write-Host "8) New DFIR Case"
+    Write-Host "9) Evidence Intake (for case)"
+    Write-Host "10) Run Profile Modules (for case)"
+    Write-Host "11) Build Timeline (for case)"
+    Write-Host "12) Validate Chain-of-Custody"
+    Write-Host "Q) Quit"
 
     while ($true) {
-        $mainChoice = Show-MainMenu
-
-        switch ($mainChoice) {
-            "1" {
-                $p = Show-PrimaryMenu
-                Run-PrimaryModules -choice $p
-            }
-            "2" {
-                $s = Show-SecondaryMenu
-                Run-SecondaryModules -choice $s
-            }
-            "3" {
-                $a = Show-AdvancedMenu
-                Run-AdvancedModules -choice $a
-            }
-            "4" {
-                Run-PrimaryModules   -choice "4"
-                Run-SecondaryModules -choice "3"
-                Run-AdvancedModules  -choice "3"
-            }
+        $choice = Read-Host "Select option"
+        switch ($choice) {
+            "1" { Invoke-EnvironmentValidator | Out-Null }
+            "2" { Show-ToolIntegrityDashboard }
+            "3" { Invoke-PostReleaseSmokeTest -ReleaseRoot $ScriptRoot | Out-Null }
+            "4" { Select-DfirProfile }
             "5" {
-                Write-Log "DFIR Console exiting."
-                break
+                Export-ToolIntegrityJson
+                Export-ToolIntegrityHtml
             }
-            default {
-                Write-Host "Invalid choice."
+            "6" { Export-ReleaseManifestJson -TagName "manual-cli" }
+            "7" { New-ForensicReportTemplate -TagName "manual-cli" }
+            "8" {
+                $casePath = New-DfirCase
+                Write-Host "Active case path: $casePath"
             }
+            "9" {
+                $casePath = Read-Host "Case path"
+                Invoke-EvidenceIntake -CasePath $casePath
+            }
+            "10" {
+                $casePath = Read-Host "Case path"
+                Invoke-ProfileModuleRunner -CasePath $casePath
+            }
+            "11" {
+                $casePath = Read-Host "Case path"
+                Build-Timeline -CasePath $casePath
+            }
+            "12" {
+                $casePath = Read-Host "Case path"
+                Validate-ChainOfCustody -CasePath $casePath
+            }   
+            "Q" { break }
+            "q" { break }
+            default { Write-Host "Invalid selection." }
         }
     }
 }
 
-# ============================================================
-# Start Console
-# ============================================================
+# ==========================
+#  Mode Selection
+# ==========================
+Write-Host "=== BLACKBOX256 DFIR Console Loader ==="
+Write-Host "Select interface mode:"
+Write-Host "1) Text CLI"
+Write-Host "2) GUI"
 
-Start-DFIRConsole
+$mode = Read-Host "Enter choice (1/2)"
+
+switch ($mode) {
+    "1" { Start-CliInterface }
+    "2" { Start-GuiInterface }
+    default {
+        Write-Host "Invalid choice, defaulting to CLI."
+        Start-CliInterface
+    }
+}
+<#
+.SYNOPSIS
+    BLACKBOX256 DFIR Console Loader
+
+.DESCRIPTION
+    Entry point for BLACKBOX256-DFIR-Console:
+      - First-run environment validation
+      - Sysinternals auto-download
+      - Tool integrity dashboard (CLI + GUI)
+      - DFIR profile selector (manual + tag-based)
+      - Profile-aware post-release smoke test
+      - JSON/HTML integrity export
+      - DFIR Release Manifest JSON
+      - Forensic report template
+#>
+
+# --- Global paths ---
+$ScriptRoot      = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$ModulesRoot     = Join-Path $ScriptRoot "Modules"
+$ToolsRoot       = Join-Path $ScriptRoot "Tools"
+$SysinternalsMod = Join-Path $ModulesRoot "Sysinternals\Get-Sysinternals.ps1"
+
+# --- Load Sysinternals auto-download ---
+if (Test-Path $SysinternalsMod) {
+    Import-Module $SysinternalsMod -Force
+    $Global:SysinternalsPath = Get-SysinternalsSuite
+} else {
+    Write-Warning "Sysinternals module not found: $SysinternalsMod"
+}
+
+# Default DFIR profile
+if (-not $Global:DfirProfile) { $Global:DfirProfile = "Generic Triage" }
+if (-not $Global:DfirTools)   { $Global:DfirTools   = @("Plaso","Chainsaw","Sysinternals Suite") }
+
+# ==========================
+#  First-Run Environment Validator
+# ==========================
+function Invoke-EnvironmentValidator {
+    Write-Host "=== Environment Validator ==="
+
+    $issues = @()
+
+    # PowerShell version
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $issues += "PowerShell 7+ is recommended. Current: $($PSVersionTable.PSVersion)"
+    }
+
+    # Required folders
+    foreach ($path in @($ModulesRoot, $ToolsRoot)) {
+        if (-not (Test-Path $path)) {
+            $issues += "Missing required directory: $path"
+        }
+    }
+
+    # Sysinternals presence
+    if (-not (Test-Path $Global:SysinternalsPath)) {
+        $issues += "Sysinternals Suite not present at: $Global:SysinternalsPath"
+    }
+
+    if ($issues.Count -eq 0) {
+        Write-Host "[+] Environment OK" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "[!] Environment issues detected:" -ForegroundColor Yellow
+        $issues | ForEach-Object { Write-Host " - $_" }
+        return $false
+    }
+}
+
+# ==========================
+#  Tool Integrity Dashboard (CLI)
+# ==========================
+function Show-ToolIntegrityDashboard {
+    Write-Host "=== Tool Integrity Dashboard (CLI) ==="
+
+    $tools = Get-ToolIntegrityData
+
+    foreach ($tool in $tools) {
+        $color = if ($tool.Status -eq "OK") { "Green" } else { "Red" }
+        Write-Host ("{0,-20} {1,-8} {2}" -f $tool.Name, $tool.Status, $tool.Path) -ForegroundColor $color
+    }
+}
+
+# ==========================
+#  Tool Integrity Data (shared)
+# ==========================
+function Get-ToolIntegrityData {
+    $tools = @(
+        @{ Name = "Sysinternals Suite"; Path = $Global:SysinternalsPath },
+        @{ Name = "Plaso";              Path = Join-Path $ToolsRoot "Plaso" },
+        @{ Name = "Chainsaw";           Path = Join-Path $ToolsRoot "Chainsaw" },
+        @{ Name = "EZTools";            Path = Join-Path $ToolsRoot "EZTools" },
+        @{ Name = "Volatility";         Path = Join-Path $ToolsRoot "Volatility" },
+        @{ Name = "YARA";               Path = Join-Path $ToolsRoot "YARA" }
+    )
+
+    $data = @()
+
+    foreach ($tool in $tools) {
+        $exists = Test-Path $tool.Path
+        $data += [PSCustomObject]@{
+            Name   = $tool.Name
+            Path   = $tool.Path
+            Status = if ($exists) { "OK" } else { "MISSING" }
+        }
+    }
+
+    return $data
+}
+
+# ==========================
+#  Tool Integrity Export (JSON/HTML)
+# ==========================
+function Export-ToolIntegrityJson {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\tool-integrity.json"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $data = Get-ToolIntegrityData
+    $data | ConvertTo-Json -Depth 3 | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Tool integrity JSON exported to: $OutputPath"
+}
+
+function Export-ToolIntegrityHtml {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\tool-integrity.html"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $data = Get-ToolIntegrityData
+
+    $html = @"
+<html>
+<head>
+    <title>BLACKBOX256 Tool Integrity Dashboard</title>
+    <style>
+        body { font-family: Segoe UI, sans-serif; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ccc; padding: 8px; }
+        th { background-color: #f0f0f0; }
+        .ok { color: green; }
+        .missing { color: red; }
+    </style>
+</head>
+<body>
+<h1>BLACKBOX256 Tool Integrity Dashboard</h1>
+<p>DFIR Profile: $Global:DfirProfile</p>
+<table>
+<tr><th>Name</th><th>Status</th><th>Path</th></tr>
+"@
+
+    foreach ($item in $data) {
+        $cls = if ($item.Status -eq "OK") { "ok" } else { "missing" }
+        $html += "<tr><td>$($item.Name)</td><td class='$cls'>$($item.Status)</td><td>$($item.Path)</td></tr>`n"
+    }
+
+    $html += @"
+</table>
+</body>
+</html>
+"@
+
+    $html | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Tool integrity HTML exported to: $OutputPath"
+}
+
+# ==========================
+#  DFIR Profile Selector (manual)
+# ==========================
+function Select-DfirProfile {
+    Write-Host "=== DFIR Profile Selector ==="
+    Write-Host "1) Ransomware Incident"
+    Write-Host "2) Insider Data Theft"
+    Write-Host "3) Web Server Compromise"
+    Write-Host "4) Generic Triage"
+
+    $choice = Read-Host "Select profile"
+
+    switch ($choice) {
+        "1" {
+            $Global:DfirProfile = "Ransomware"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Volatility", "YARA", "Sysinternals Suite")
+        }
+        "2" {
+            $Global:DfirProfile = "Insider Theft"
+            $Global:DfirTools = @("Plaso", "Browser Forensics", "EZTools", "YARA")
+        }
+        "3" {
+            $Global:DfirProfile = "Web Compromise"
+            $Global:DfirTools = @("Plaso", "Log Parsers", "YARA", "Sysinternals Suite")
+        }
+        "4" {
+            $Global:DfirProfile = "Generic Triage"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Sysinternals Suite")
+        }
+        default {
+            Write-Host "Invalid selection, defaulting to Generic Triage."
+            $Global:DfirProfile = "Generic Triage"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Sysinternals Suite")
+        }
+    }
+
+    Write-Host "[+] Active DFIR profile: $Global:DfirProfile"
+    Write-Host "[+] Tools in profile: $($Global:DfirTools -join ', ')"
+}
+
+# ==========================
+#  DFIR Profile Selector (from tag)
+# ==========================
+function Select-DfirProfileFromTag {
+    param([string]$TagName)
+
+    if ($TagName -match "ransomware") {
+        $Global:DfirProfile = "Ransomware"
+        $Global:DfirTools = @("Plaso","Chainsaw","Volatility","YARA","Sysinternals Suite")
+    }
+    elseif ($TagName -match "insider") {
+        $Global:DfirProfile = "Insider Theft"
+        $Global:DfirTools = @("Plaso","Browser Forensics","EZTools","YARA")
+    }
+    elseif ($TagName -match "web") {
+        $Global:DfirProfile = "Web Compromise"
+        $Global:DfirTools = @("Plaso","Log Parsers","YARA","Sysinternals Suite")
+    }
+    else {
+        $Global:DfirProfile = "Generic Triage"
+        $Global:DfirTools = @("Plaso","Chainsaw","Sysinternals Suite")
+    }
+
+    Write-Host "[+] Auto-selected DFIR profile from tag '$TagName': $Global:DfirProfile"
+    Write-Host "[+] Tools: $($Global:DfirTools -join ', ')"
+}
+
+# ==========================
+#  DFIR Release Manifest JSON
+# ==========================
+function Export-ReleaseManifestJson {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\release-manifest.json",
+        [string]$TagName    = "unknown"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $versionFile = Join-Path $ScriptRoot "VERSION"
+    $version     = if (Test-Path $versionFile) { Get-Content $versionFile } else { "unknown" }
+
+    $tools = Get-ToolIntegrityData
+
+    $manifest = [PSCustomObject]@{
+        Project      = "BLACKBOX256-DFIR-Console"
+        Version      = $version
+        Tag          = $TagName
+        DfirProfile  = $Global:DfirProfile
+        Tools        = $tools
+        GeneratedAt  = (Get-Date).ToString("o")
+    }
+
+    $manifest | ConvertTo-Json -Depth 5 | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Release manifest JSON exported to: $OutputPath"
+}
+
+# ==========================
+#  Forensic Report Template
+# ==========================
+function New-ForensicReportTemplate {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\forensic-report-template.md",
+        [string]$TagName    = "unknown"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $versionFile = Join-Path $ScriptRoot "VERSION"
+    $version     = if (Test-Path $versionFile) { Get-Content $versionFile } else { "unknown" }
+
+    $content = @"
+# BLACKBOX256 DFIR Report
+
+- Project: BLACKBOX256-DFIR-Console
+- Version: $version
+- Tag: $TagName
+- DFIR Profile: $Global:DfirProfile
+- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+## 1. Incident Summary
+
+## 2. Scope and Assets
+
+## 3. Tools Used
+
+$(($Global:DfirTools -join ", "))
+
+## 4. Timeline
+
+## 5. Findings
+
+## 6. Recommendations
+
+"@
+
+    $content | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Forensic report template exported to: $OutputPath"
+}
+
+# ==========================
+#  Post-Release Smoke Test (profile-aware)
+# ==========================
+function Invoke-PostReleaseSmokeTest {
+    param([string]$ReleaseRoot = $ScriptRoot)
+
+    Write-Host "=== Post-Release Smoke Test ==="
+
+    $checks = @(
+        @{ Name = "DFIR-Console.ps1"; Path = Join-Path $ReleaseRoot "DFIR-Console.ps1" },
+        @{ Name = "Modules";          Path = Join-Path $ReleaseRoot "Modules" },
+        @{ Name = "Tools";            Path = Join-Path $ReleaseRoot "Tools" },
+        @{ Name = "VERSION";          Path = Join-Path $ReleaseRoot "VERSION" }
+    )
+
+    $failed = @()
+
+    foreach ($check in $checks) {
+        if (Test-Path $check.Path) {
+            Write-Host "[+] $($check.Name) present" -ForegroundColor Green
+        } else {
+            Write-Host "[!] $($check.Name) missing: $($check.Path)" -ForegroundColor Red
+            $failed += $check.Name
+        }
+    }
+
+    Write-Host "[+] Checking DFIR profile tools: $Global:DfirProfile"
+
+    foreach ($tool in $Global:DfirTools) {
+        $path = switch ($tool) {
+            "Sysinternals Suite" { $Global:SysinternalsPath }
+            "Plaso"              { Join-Path $ToolsRoot "Plaso" }
+            "Chainsaw"           { Join-Path $ToolsRoot "Chainsaw" }
+            "EZTools"            { Join-Path $ToolsRoot "EZTools" }
+            "Volatility"         { Join-Path $ToolsRoot "Volatility" }
+            "YARA"               { Join-Path $ToolsRoot "YARA" }
+            "Browser Forensics"  { Join-Path $ToolsRoot "BrowserForensics" }
+            "Log Parsers"        { Join-Path $ToolsRoot "LogParsers" }
+            default              { Join-Path $ToolsRoot $tool }
+        }
+
+        if (Test-Path $path) {
+            Write-Host "[+] $tool present at $path" -ForegroundColor Green
+        } else {
+            Write-Host "[!] $tool missing at $path" -ForegroundColor Red
+            $failed += $tool
+        }
+    }
+
+    if ($failed.Count -eq 0) {
+        Write-Host "[+] Smoke test PASSED" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "[!] Smoke test FAILED. Missing: $($failed -join ', ')" -ForegroundColor Red
+        return $false
+    }
+}
+
+# ==========================
+#  GUI Interface (WPF)
+# ==========================
+function Start-GuiInterface {
+    Add-Type -AssemblyName PresentationFramework
+
+    $window = New-Object Windows.Window
+    $window.Title = "BLACKBOX256 DFIR Console"
+    $window.Width = 800
+    $window.Height = 600
+
+    $grid = New-Object Windows.Controls.Grid
+    $window.Content = $grid
+
+    # Buttons
+    $btnEnv = New-Object Windows.Controls.Button
+    $btnEnv.Content = "Environment Validator"
+    $btnEnv.Margin = "10,10,10,0"
+    $btnEnv.Height = 40
+
+    $btnTools = New-Object Windows.Controls.Button
+    $btnTools.Content = "Tool Integrity Dashboard"
+    $btnTools.Margin = "10,60,10,0"
+    $btnTools.Height = 40
+
+    $btnSmoke = New-Object Windows.Controls.Button
+    $btnSmoke.Content = "Post-Release Smoke Test"
+    $btnSmoke.Margin = "10,110,10,0"
+    $btnSmoke.Height = 40
+
+    $btnProfile = New-Object Windows.Controls.Button
+    $btnProfile.Content = "DFIR Profile Selector"
+    $btnProfile.Margin = "10,160,10,0"
+    $btnProfile.Height = 40
+
+    $output = New-Object Windows.Controls.TextBox
+    $output.Margin = "10,210,10,10"
+    $output.VerticalScrollBarVisibility = "Auto"
+    $output.HorizontalScrollBarVisibility = "Auto"
+    $output.AcceptsReturn = $true
+    $output.IsReadOnly = $true
+
+    $grid.Children.Add($btnEnv)
+    $grid.Children.Add($btnTools)
+    $grid.Children.Add($btnSmoke)
+    $grid.Children.Add($btnProfile)
+    $grid.Children.Add($output)
+
+    # Wire up events
+    $btnEnv.Add_Click({
+        $result = Invoke-EnvironmentValidator
+        $output.AppendText("Environment Validator: $result`r`n")
+    })
+
+    $btnTools.Add_Click({
+        $output.AppendText("Tool Integrity Dashboard:`r`n")
+        $tools = Get-ToolIntegrityData
+        foreach ($tool in $tools) {
+            $output.AppendText((" - {0}: {1}`r`n" -f $tool.Name, $tool.Status))
+        }
+    })
+
+    $btnSmoke.Add_Click({
+        $result = Invoke-PostReleaseSmokeTest -ReleaseRoot $ScriptRoot
+        $output.AppendText("Smoke Test: $result`r`n")
+    })
+
+    $btnProfile.Add_Click({
+        Select-DfirProfile
+        $output.AppendText("DFIR Profile: $Global:DfirProfile`r`n")
+    })
+
+    $window.ShowDialog() | Out-Null
+}
+
+# ==========================
+#  CLI Interface
+# ==========================
+function Start-CliInterface {
+    Write-Host "=== BLACKBOX256 DFIR Console (CLI) ==="
+    Write-Host "1) Environment Validator"
+    Write-Host "2) Tool Integrity Dashboard"
+    Write-Host "3) Post-Release Smoke Test"
+    Write-Host "4) DFIR Profile Selector"
+    Write-Host "5) Export Integrity (JSON/HTML)"
+    Write-Host "6) Export Release Manifest"
+    Write-Host "7) Generate Forensic Report Template"
+    Write-Host "Q) Quit"
+
+    while ($true) {
+        $choice = Read-Host "Select option"
+        switch ($choice) {
+            "1" { Invoke-EnvironmentValidator | Out-Null }
+            "2" { Show-ToolIntegrityDashboard }
+            "3" { Invoke-PostReleaseSmokeTest -ReleaseRoot $ScriptRoot | Out-Null }
+            "4" { Select-DfirProfile }
+            "5" {
+                Export-ToolIntegrityJson
+                Export-ToolIntegrityHtml
+            }
+            "6" { Export-ReleaseManifestJson -TagName "manual-cli" }
+            "7" { New-ForensicReportTemplate -TagName "manual-cli" }
+            "Q" { break }
+            "q" { break }
+            default { Write-Host "Invalid selection." }
+        }
+    }
+}
+
+# ==========================
+#  Mode Selection
+# ==========================
+Write-Host "=== BLACKBOX256 DFIR Console Loader ==="
+Write-Host "Select interface mode:"
+Write-Host "1) Text CLI"
+Write-Host "2) GUI"
+
+$mode = Read-Host "Enter choice (1/2)"
+
+switch ($mode) {
+    "1" { Start-CliInterface }
+    "2" { Start-GuiInterface }
+    default {
+        Write-Host "Invalid choice, defaulting to CLI."
+        Start-CliInterface
+    }
+}
+<#
+.SYNOPSIS
+    BLACKBOX256 DFIR Console Loader
+
+.DESCRIPTION
+    Entry point for BLACKBOX256-DFIR-Console:
+      - First-run environment validation
+      - Sysinternals auto-download
+      - Tool integrity dashboard (CLI + GUI)
+      - DFIR profile selector (manual + tag-based)
+      - Profile-aware post-release smoke test
+      - JSON/HTML integrity export
+      - DFIR Release Manifest JSON
+      - Forensic report template
+#>
+
+# --- Global paths ---
+$ScriptRoot      = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$ModulesRoot     = Join-Path $ScriptRoot "Modules"
+$ToolsRoot       = Join-Path $ScriptRoot "Tools"
+$SysinternalsMod = Join-Path $ModulesRoot "Sysinternals\Get-Sysinternals.ps1"
+
+# --- Load Sysinternals auto-download ---
+if (Test-Path $SysinternalsMod) {
+    Import-Module $SysinternalsMod -Force
+    $Global:SysinternalsPath = Get-SysinternalsSuite
+} else {
+    Write-Warning "Sysinternals module not found: $SysinternalsMod"
+}
+
+# Default DFIR profile
+if (-not $Global:DfirProfile) { $Global:DfirProfile = "Generic Triage" }
+if (-not $Global:DfirTools)   { $Global:DfirTools   = @("Plaso","Chainsaw","Sysinternals Suite") }
+
+# ==========================
+#  First-Run Environment Validator
+# ==========================
+function Invoke-EnvironmentValidator {
+    Write-Host "=== Environment Validator ==="
+
+    $issues = @()
+
+    # PowerShell version
+    if ($PSVersionTable.PSVersion.Major -lt 7) {
+        $issues += "PowerShell 7+ is recommended. Current: $($PSVersionTable.PSVersion)"
+    }
+
+    # Required folders
+    foreach ($path in @($ModulesRoot, $ToolsRoot)) {
+        if (-not (Test-Path $path)) {
+            $issues += "Missing required directory: $path"
+        }
+    }
+
+    # Sysinternals presence
+    if (-not (Test-Path $Global:SysinternalsPath)) {
+        $issues += "Sysinternals Suite not present at: $Global:SysinternalsPath"
+    }
+
+    if ($issues.Count -eq 0) {
+        Write-Host "[+] Environment OK" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "[!] Environment issues detected:" -ForegroundColor Yellow
+        $issues | ForEach-Object { Write-Host " - $_" }
+        return $false
+    }
+}
+
+# ==========================
+#  Tool Integrity Dashboard (CLI)
+# ==========================
+function Show-ToolIntegrityDashboard {
+    Write-Host "=== Tool Integrity Dashboard (CLI) ==="
+
+    $tools = Get-ToolIntegrityData
+
+    foreach ($tool in $tools) {
+        $color = if ($tool.Status -eq "OK") { "Green" } else { "Red" }
+        Write-Host ("{0,-20} {1,-8} {2}" -f $tool.Name, $tool.Status, $tool.Path) -ForegroundColor $color
+    }
+}
+
+# ==========================
+#  Tool Integrity Data (shared)
+# ==========================
+function Get-ToolIntegrityData {
+    $tools = @(
+        @{ Name = "Sysinternals Suite"; Path = $Global:SysinternalsPath },
+        @{ Name = "Plaso";              Path = Join-Path $ToolsRoot "Plaso" },
+        @{ Name = "Chainsaw";           Path = Join-Path $ToolsRoot "Chainsaw" },
+        @{ Name = "EZTools";            Path = Join-Path $ToolsRoot "EZTools" },
+        @{ Name = "Volatility";         Path = Join-Path $ToolsRoot "Volatility" },
+        @{ Name = "YARA";               Path = Join-Path $ToolsRoot "YARA" }
+    )
+
+    $data = @()
+
+    foreach ($tool in $tools) {
+        $exists = Test-Path $tool.Path
+        $data += [PSCustomObject]@{
+            Name   = $tool.Name
+            Path   = $tool.Path
+            Status = if ($exists) { "OK" } else { "MISSING" }
+        }
+    }
+
+    return $data
+}
+
+# ==========================
+#  Tool Integrity Export (JSON/HTML)
+# ==========================
+function Export-ToolIntegrityJson {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\tool-integrity.json"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $data = Get-ToolIntegrityData
+    $data | ConvertTo-Json -Depth 3 | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Tool integrity JSON exported to: $OutputPath"
+}
+
+function Export-ToolIntegrityHtml {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\tool-integrity.html"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $data = Get-ToolIntegrityData
+
+    $html = @"
+<html>
+<head>
+    <title>BLACKBOX256 Tool Integrity Dashboard</title>
+    <style>
+        body { font-family: Segoe UI, sans-serif; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ccc; padding: 8px; }
+        th { background-color: #f0f0f0; }
+        .ok { color: green; }
+        .missing { color: red; }
+    </style>
+</head>
+<body>
+<h1>BLACKBOX256 Tool Integrity Dashboard</h1>
+<p>DFIR Profile: $Global:DfirProfile</p>
+<table>
+<tr><th>Name</th><th>Status</th><th>Path</th></tr>
+"@
+
+    foreach ($item in $data) {
+        $cls = if ($item.Status -eq "OK") { "ok" } else { "missing" }
+        $html += "<tr><td>$($item.Name)</td><td class='$cls'>$($item.Status)</td><td>$($item.Path)</td></tr>`n"
+    }
+
+    $html += @"
+</table>
+</body>
+</html>
+"@
+
+    $html | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Tool integrity HTML exported to: $OutputPath"
+}
+
+# ==========================
+#  DFIR Profile Selector (manual)
+# ==========================
+function Select-DfirProfile {
+    Write-Host "=== DFIR Profile Selector ==="
+    Write-Host "1) Ransomware Incident"
+    Write-Host "2) Insider Data Theft"
+    Write-Host "3) Web Server Compromise"
+    Write-Host "4) Generic Triage"
+
+    $choice = Read-Host "Select profile"
+
+    switch ($choice) {
+        "1" {
+            $Global:DfirProfile = "Ransomware"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Volatility", "YARA", "Sysinternals Suite")
+        }
+        "2" {
+            $Global:DfirProfile = "Insider Theft"
+            $Global:DfirTools = @("Plaso", "Browser Forensics", "EZTools", "YARA")
+        }
+        "3" {
+            $Global:DfirProfile = "Web Compromise"
+            $Global:DfirTools = @("Plaso", "Log Parsers", "YARA", "Sysinternals Suite")
+        }
+        "4" {
+            $Global:DfirProfile = "Generic Triage"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Sysinternals Suite")
+        }
+        default {
+            Write-Host "Invalid selection, defaulting to Generic Triage."
+            $Global:DfirProfile = "Generic Triage"
+            $Global:DfirTools = @("Plaso", "Chainsaw", "Sysinternals Suite")
+        }
+    }
+
+    Write-Host "[+] Active DFIR profile: $Global:DfirProfile"
+    Write-Host "[+] Tools in profile: $($Global:DfirTools -join ', ')"
+}
+
+# ==========================
+#  DFIR Profile Selector (from tag)
+# ==========================
+function Select-DfirProfileFromTag {
+    param([string]$TagName)
+
+    if ($TagName -match "ransomware") {
+        $Global:DfirProfile = "Ransomware"
+        $Global:DfirTools = @("Plaso","Chainsaw","Volatility","YARA","Sysinternals Suite")
+    }
+    elseif ($TagName -match "insider") {
+        $Global:DfirProfile = "Insider Theft"
+        $Global:DfirTools = @("Plaso","Browser Forensics","EZTools","YARA")
+    }
+    elseif ($TagName -match "web") {
+        $Global:DfirProfile = "Web Compromise"
+        $Global:DfirTools = @("Plaso","Log Parsers","YARA","Sysinternals Suite")
+    }
+    else {
+        $Global:DfirProfile = "Generic Triage"
+        $Global:DfirTools = @("Plaso","Chainsaw","Sysinternals Suite")
+    }
+
+    Write-Host "[+] Auto-selected DFIR profile from tag '$TagName': $Global:DfirProfile"
+    Write-Host "[+] Tools: $($Global:DfirTools -join ', ')"
+}
+
+# ==========================
+#  DFIR Release Manifest JSON
+# ==========================
+function Export-ReleaseManifestJson {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\release-manifest.json",
+        [string]$TagName    = "unknown"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $versionFile = Join-Path $ScriptRoot "VERSION"
+    $version     = if (Test-Path $versionFile) { Get-Content $versionFile } else { "unknown" }
+
+    $tools = Get-ToolIntegrityData
+
+    $manifest = [PSCustomObject]@{
+        Project      = "BLACKBOX256-DFIR-Console"
+        Version      = $version
+        Tag          = $TagName
+        DfirProfile  = $Global:DfirProfile
+        Tools        = $tools
+        GeneratedAt  = (Get-Date).ToString("o")
+    }
+
+    $manifest | ConvertTo-Json -Depth 5 | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Release manifest JSON exported to: $OutputPath"
+}
+
+# ==========================
+#  Forensic Report Template
+# ==========================
+function New-ForensicReportTemplate {
+    param(
+        [string]$OutputPath = "$ScriptRoot\dist\forensic-report-template.md",
+        [string]$TagName    = "unknown"
+    )
+
+    if (-not (Test-Path (Split-Path $OutputPath))) {
+        New-Item -ItemType Directory -Path (Split-Path $OutputPath) | Out-Null
+    }
+
+    $versionFile = Join-Path $ScriptRoot "VERSION"
+    $version     = if (Test-Path $versionFile) { Get-Content $versionFile } else { "unknown" }
+
+    $content = @"
+# BLACKBOX256 DFIR Report
+
+- Project: BLACKBOX256-DFIR-Console
+- Version: $version
+- Tag: $TagName
+- DFIR Profile: $Global:DfirProfile
+- Generated: $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+
+## 1. Incident Summary
+
+## 2. Scope and Assets
+
+## 3. Tools Used
+
+$(($Global:DfirTools -join ", "))
+
+## 4. Timeline
+
+## 5. Findings
+
+## 6. Recommendations
+
+"@
+
+    $content | Out-File $OutputPath -Encoding UTF8
+    Write-Host "[+] Forensic report template exported to: $OutputPath"
+}
+
+# ==========================
+#  Post-Release Smoke Test (profile-aware)
+# ==========================
+function Invoke-PostReleaseSmokeTest {
+    param([string]$ReleaseRoot = $ScriptRoot)
+
+    Write-Host "=== Post-Release Smoke Test ==="
+
+    $checks = @(
+        @{ Name = "DFIR-Console.ps1"; Path = Join-Path $ReleaseRoot "DFIR-Console.ps1" },
+        @{ Name = "Modules";          Path = Join-Path $ReleaseRoot "Modules" },
+        @{ Name = "Tools";            Path = Join-Path $ReleaseRoot "Tools" },
+        @{ Name = "VERSION";          Path = Join-Path $ReleaseRoot "VERSION" }
+    )
+
+    $failed = @()
+
+    foreach ($check in $checks) {
+        if (Test-Path $check.Path) {
+            Write-Host "[+] $($check.Name) present" -ForegroundColor Green
+        } else {
+            Write-Host "[!] $($check.Name) missing: $($check.Path)" -ForegroundColor Red
+            $failed += $check.Name
+        }
+    }
+
+    Write-Host "[+] Checking DFIR profile tools: $Global:DfirProfile"
+
+    foreach ($tool in $Global:DfirTools) {
+        $path = switch ($tool) {
+            "Sysinternals Suite" { $Global:SysinternalsPath }
+            "Plaso"              { Join-Path $ToolsRoot "Plaso" }
+            "Chainsaw"           { Join-Path $ToolsRoot "Chainsaw" }
+            "EZTools"            { Join-Path $ToolsRoot "EZTools" }
+            "Volatility"         { Join-Path $ToolsRoot "Volatility" }
+            "YARA"               { Join-Path $ToolsRoot "YARA" }
+            "Browser Forensics"  { Join-Path $ToolsRoot "BrowserForensics" }
+            "Log Parsers"        { Join-Path $ToolsRoot "LogParsers" }
+            default              { Join-Path $ToolsRoot $tool }
+        }
+
+        if (Test-Path $path) {
+            Write-Host "[+] $tool present at $path" -ForegroundColor Green
+        } else {
+            Write-Host "[!] $tool missing at $path" -ForegroundColor Red
+            $failed += $tool
+        }
+    }
+
+    if ($failed.Count -eq 0) {
+        Write-Host "[+] Smoke test PASSED" -ForegroundColor Green
+        return $true
+    } else {
+        Write-Host "[!] Smoke test FAILED. Missing: $($failed -join ', ')" -ForegroundColor Red
+        return $false
+    }
+}
+
+# ==========================
+#  GUI Interface (WPF)
+# ==========================
+function Start-GuiInterface {
+    Add-Type -AssemblyName PresentationFramework
+
+    $window = New-Object Windows.Window
+    $window.Title = "BLACKBOX256 DFIR Console"
+    $window.Width = 800
+    $window.Height = 600
+
+    $grid = New-Object Windows.Controls.Grid
+    $window.Content = $grid
+
+    # Buttons
+    $btnEnv = New-Object Windows.Controls.Button
+    $btnEnv.Content = "Environment Validator"
+    $btnEnv.Margin = "10,10,10,0"
+    $btnEnv.Height = 40
+
+    $btnTools = New-Object Windows.Controls.Button
+    $btnTools.Content = "Tool Integrity Dashboard"
+    $btnTools.Margin = "10,60,10,0"
+    $btnTools.Height = 40
+
+    $btnSmoke = New-Object Windows.Controls.Button
+    $btnSmoke.Content = "Post-Release Smoke Test"
+    $btnSmoke.Margin = "10,110,10,0"
+    $btnSmoke.Height = 40
+
+    $btnProfile = New-Object Windows.Controls.Button
+    $btnProfile.Content = "DFIR Profile Selector"
+    $btnProfile.Margin = "10,160,10,0"
+    $btnProfile.Height = 40
+
+    $output = New-Object Windows.Controls.TextBox
+    $output.Margin = "10,210,10,10"
+    $output.VerticalScrollBarVisibility = "Auto"
+    $output.HorizontalScrollBarVisibility = "Auto"
+    $output.AcceptsReturn = $true
+    $output.IsReadOnly = $true
+
+    $grid.Children.Add($btnEnv)
+    $grid.Children.Add($btnTools)
+    $grid.Children.Add($btnSmoke)
+    $grid.Children.Add($btnProfile)
+    $grid.Children.Add($output)
+
+    # Wire up events
+    $btnEnv.Add_Click({
+        $result = Invoke-EnvironmentValidator
+        $output.AppendText("Environment Validator: $result`r`n")
+    })
+
+    $btnTools.Add_Click({
+        $output.AppendText("Tool Integrity Dashboard:`r`n")
+        $tools = Get-ToolIntegrityData
+        foreach ($tool in $tools) {
+            $output.AppendText((" - {0}: {1}`r`n" -f $tool.Name, $tool.Status))
+        }
+    })
+
+    $btnSmoke.Add_Click({
+        $result = Invoke-PostReleaseSmokeTest -ReleaseRoot $ScriptRoot
+        $output.AppendText("Smoke Test: $result`r`n")
+    })
+
+    $btnProfile.Add_Click({
+        Select-DfirProfile
+        $output.AppendText("DFIR Profile: $Global:DfirProfile`r`n")
+    })
+
+    $window.ShowDialog() | Out-Null
+}
+
+# ==========================
+#  CLI Interface
+# ==========================
+function Start-CliInterface {
+    Write-Host "=== BLACKBOX256 DFIR Console (CLI) ==="
+    Write-Host "1) Environment Validator"
+    Write-Host "2) Tool Integrity Dashboard"
+    Write-Host "3) Post-Release Smoke Test"
+    Write-Host "4) DFIR Profile Selector"
+    Write-Host "5) Export Integrity (JSON/HTML)"
+    Write-Host "6) Export Release Manifest"
+    Write-Host "7) Generate Forensic Report Template"
+    Write-Host "Q) Quit"
+
+    while ($true) {
+        $choice = Read-Host "Select option"
+        switch ($choice) {
+            "1" { Invoke-EnvironmentValidator | Out-Null }
+            "2" { Show-ToolIntegrityDashboard }
+            "3" { Invoke-PostReleaseSmokeTest -ReleaseRoot $ScriptRoot | Out-Null }
+            "4" { Select-DfirProfile }
+            "5" {
+                Export-ToolIntegrityJson
+                Export-ToolIntegrityHtml
+            }
+            "6" { Export-ReleaseManifestJson -TagName "manual-cli" }
+            "7" { New-ForensicReportTemplate -TagName "manual-cli" }
+            "Q" { break }
+            "q" { break }
+            default { Write-Host "Invalid selection." }
+        }
+    }
+}
+
+# ==========================
+#  Mode Selection
+# ==========================
+Write-Host "=== BLACKBOX256 DFIR Console Loader ==="
+Write-Host "Select interface mode:"
+Write-Host "1) Text CLI"
+Write-Host "2) GUI"
+
+$mode = Read-Host "Enter choice (1/2)"
+
+switch ($mode) {
+    "1" { Start-CliInterface }
+    "2" { Start-GuiInterface }
+    default {
+        Write-Host "Invalid choice, defaulting to CLI."
+        Start-CliInterface
+    }
+}

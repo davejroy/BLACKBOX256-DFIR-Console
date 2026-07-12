@@ -1,3 +1,5 @@
+dist/
 Tools/Sysinternals/
 *.zip
-*.exe
+*.sha256.txt
+Cases/
