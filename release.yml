@@ -1,0 +1,56 @@
+name: Release BLACKBOX256
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PowerShell
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build release ZIP
+        shell: pwsh
+        run: |
+          ./Build-Release.ps1 -Tag "${{ github.ref_name }}"
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          release_name: "BLACKBOX256 ${{
+            github.ref_name
+          }}"
+          draft: false
+          prerelease: false
+
+      - name: Upload ZIP asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/BLACKBOX256_USB-${{ github.ref_name }}.zip
+          asset_name: BLACKBOX256_USB-${{ github.ref_name }}.zip
+          asset_content_type: application/zip
+
+      - name: Upload SHA256 asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./dist/BLACKBOX256_USB-${{ github.ref_name }}.sha256.txt
+          asset_name: BLACKBOX256_USB-${{ github.ref_name }}.sha256.txt
+          asset_content_type: text/plain
